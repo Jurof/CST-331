@@ -1,0 +1,205 @@
+/*
+ * File:   Lab6_main.c
+ * Author: kevin.juba
+ *
+ * Created on November 20, 2014, 11:23 AM
+ */
+
+#define _SUPPRESS_PLIB_WARNING
+#include <xc.h>
+#include <plib.h>
+
+#pragma config POSCMOD=XT, FNOSC=PRIPLL, FPLLIDIV=DIV_2, FPLLMUL=MUL_20, FPLLODIV=DIV_1
+#pragma config FPBDIV=DIV_4, FWDTEN=OFF, CP=OFF, BWP=OFF
+#pragma config FSOSCEN=OFF, IESO=OFF
+
+#pragma interrupt UART IPL4 vector 24
+void UART (void);
+#pragma interrupt timer1 IPL3 vector 4
+void timer1 (void);
+#pragma interrupt timer2 IPL3 vector 8
+void timer2 (void);
+#pragma interrupt timer3 IPL3 vector 12
+void timer3 (void);
+
+char char_to_send = 0;
+char buffer [8192];
+char * start_ptr = 0;
+char * end_ptr = 0;
+char * head_ptr = 0;
+char * tail_ptr = 0;
+int num_items = 0;
+int max_items = 8192;
+int buffer_empty = 1;
+int button_press = 0;
+int wait = 1;
+int send = 0;
+
+int main(void)
+{
+    SYSTEMConfig (80000000L, SYS_CFG_WAIT_STATES | SYS_CFG_PCACHE);
+    INTEnableSystemMultiVectoredInt ();  // enable multi vector mode
+
+    PORTDCLR = 0x7;  // turn all leds off
+    TRISDCLR = 0x7;  // configure leds output
+
+    PORTFSET = 0xC;  // set the tx and rx pins high before chaning them
+    TRISFCLR = 0x8;  // configure for output
+    TRISFSET = 0x4;  // configure for input
+
+    U1MODEbits.BRGH = 1;    // brg * 4
+    U1BRG = 42;             // set BRG
+    U1MODEbits.UEN = 1;
+    U1MODEbits.PDSEL = 0;   // 8 bits no parity
+    U1MODEbits.STSEL = 0;   // 1 stop bit
+    mU1SetIntPriority (4);  // set priority level
+    U1STAbits.URXISEL = 0;  // interrupt on character recieve
+    U1STAbits.UTXISEL = 0;  // interrupt on every character sent?
+    U1STAbits.URXEN = 1;    // enable UART receiver
+    U1MODEbits.ON = 1;      // turn UART on
+    U1STAbits.UTXEN = 1;    // enable UART transmitter
+    IFS0bits.U1RXIF = 0;    // clear receive flag
+    IFS0bits.U1TXIF = 0;    // clear transmit flag
+    IEC0bits.U1RXIE = 1;    // enable receive interrupts
+    IEC0bits.U1TXIE = 1;    // enable transmit interrupts
+    IEC0bits.T1IE = 1;      // timer 1 interrupts enabled
+    IEC0bits.T2IE = 1;      // timer 2 interrupts enabled
+    IEC0bits.T3IE = 1;      // timer 3 interrupts enabled
+    mT1SetIntPriority (3);  // set timer priority
+    mT2SetIntPriority (3);
+    mT3SetIntPriority (3);
+    T1CONbits.TCKPS = 0x2;  // set timer 1 pre-scaler to 64  (timer 1 is for the debounce)
+    PR1 = 4687;            // set timer 1 pr value
+    TMR1 = 0;               // reset timer 1
+    T2CONbits.TCKPS = 0x7;  // 256 pre-scaler
+    PR2 = 39062;            // .5 sec delay
+    TMR2 = 0;               // reset timer 2
+    T3CONbits.TCKPS = 0x7;   // 256 pre-scaler
+    PR3 = 39062;            // .5 sec delay
+    TMR3 = 0;               // reset timer 3
+
+    start_ptr = &buffer [0];    // set starting pointer
+    end_ptr = &buffer [8191];   // set end pointer
+    head_ptr = start_ptr;       // set head pointer
+    tail_ptr = head_ptr;        // initialize tail pointer to same value
+
+    int x = 0;
+
+    IFS0SET = 0x8000000;        // force interrupt for testing
+
+    while (1)
+    {
+						/* Swtich press Debounce */
+        if (!(PORTC & 0x2) && button_press == 0)       // button press = 0
+        {
+            button_press = 1;      // set button press to be andded
+            for (x=0; x < 2; x++)   // check switch 2 times
+            {
+               TMR1 = 0;           // reset timer 1
+               T1CONbits.ON = 1;   // start timer 1
+               while (wait == 1);   // wait for timer to be done
+                button_press = button_press && !(PORTC & 0x2);  // and value of port to button_press
+            }
+            if (button_press)   // if portC switch was pressed every time we read it:
+            {
+                if (!buffer_empty)
+                    send = 1;
+                IFS0SET = 0x10000000;   // trigger interrupt
+            }
+        }
+									/* Swtich release Debounce */
+        else if ((PORTC & 0x2) && button_press == 1)  // button release
+        {
+            for (x=0; x < 2; x++)   // check for release 2 times
+            {
+                TMR1 = 0;           // reset timer 1
+                T1CONbits.ON = 1;   // start timer 1
+                while (wait == 1);  // wait for timer
+                button_press = button_press && (PORTC & 0x2);
+            }
+            if (button_press)   // if the switch was succesfully released:
+                button_press = 0;   // clear button_press
+            else
+                button_press = 1;   // button not succesfully released
+        }
+    };
+}
+
+void UART (void)
+{
+    do
+    {
+        IFS0CLR = 0x18000000;   // clear tx and rx interrupt flag
+
+        while (U1STA & 1)   // characters are ready to be read
+        {
+            if (num_items < max_items)  // buffer not full
+            {
+
+                PORTDSET = 0x1;  // turn receive in-progess led on
+                TMR2 = 0;    // reset timer 2
+                T2CONbits.ON = 1;// start the timer to turn it off
+
+                num_items++;            // increment total number of items
+                *(head_ptr++) = U1RXREG;    // store incoming character
+                if (head_ptr > end_ptr)     // loop pointer around if we are at the end
+                    head_ptr = start_ptr;
+
+                buffer_empty = 0;       // buffer has atleast 1 character now
+
+                if (num_items == max_items) // if buffer full :
+                     PORTDSET = 0x4;  // turn buffer full LED on
+            }
+            else
+                U1RXREG;    // dummy read if buffer is full
+        }
+
+        while (!(U1STA & 0x200) && !buffer_empty && send)   // UART tx buffer not full and character array not full
+        {
+            if (num_items > 0)  // only transmit if we have characters in the buffer
+            {
+                PORTDSET = 0x2;  // turn transmit in-progess led on
+                TMR3 = 0;    // reset timer 3
+                T3CONbits.ON = 1;// turn LED on and start the timer to turn it off
+
+                num_items--;    // decrement total number of items in buffer
+                char_to_send = *(tail_ptr++);   // get next character
+                if (tail_ptr > end_ptr)     // do we need to loop around?
+                    tail_ptr = start_ptr;   // reset tail to the starting address
+
+                U1TXREG = char_to_send;     // transmit character
+            }
+            else
+            {
+                send = 0;
+                buffer_empty = 1;   // buffer is empty since we transmited 0 or all characters
+                PORTDCLR = 0x4;  // turn buffer full led off
+            }
+        }
+    }
+    while (IFS0bits.U1RXIF | IFS0bits.U1TXIF);  // more receives / transmitts?
+};
+
+void timer1 (void)
+{
+    TMR1 = 0;   // clear timer 1
+    IFS0bits.T1IF = 0;  // clear timer 1 flag
+    T1CONbits.ON = 0;   // turn timer off
+    wait = 0;           // we have now waited our 15ms, so clear flag
+}
+
+void timer2 (void)
+{
+    PORTDCLR = 0x1;  // turn receive in-progress led off
+    TMR2 = 0;       // clear timer 2
+    IFS0bits.T2IF = 0;  // clear interrupt flag
+    T2CONbits.ON = 0;   // turn timer 2 off
+}
+
+void timer3 (void)
+{
+    PORTDCLR = 0x2;  // turn transmit in-progress led off
+    TMR3 = 0;       // reset timer 3
+    IFS0bits.T3IF = 0;  // clear interrupt flag
+    T3CONbits.ON = 0;   // turn timer off
+}
