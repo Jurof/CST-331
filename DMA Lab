@@ -1,0 +1,279 @@
+/*
+ * File:   Lab1_DMA.c
+ * Author: kevin.juba
+ *
+ * Created on January 6, 2015, 11:13 AM
+ */
+
+#define _SUPPRESS_PLIB_WARNING
+#include <xc.h>
+#include <plib.h>
+
+#pragma config POSCMOD=XT, FNOSC=PRIPLL, FPLLIDIV=DIV_2, FPLLMUL=MUL_20, FPLLODIV=DIV_1
+#pragma config FPBDIV=DIV_4, FWDTEN=OFF, CP=OFF, BWP=OFF
+#pragma config FSOSCEN=OFF, IESO=OFF
+
+#pragma interrupt timer1 IPL1 vector 4
+void timer1 (void);
+
+#pragma interrupt timer2 IPL1 vector 8
+void timer2 (void);
+
+#pragma interrupt Block_Read_Complete IPL5 vector 36
+void Block_Read_Complete (void);
+
+#pragma interrupt Block_Xmit_Complete IPL4 vector 37
+void Block_Xmit_Complete (void);
+
+char Buffer [8192];
+int Start_Timer = 0x8000;
+int LED_On = 1;
+int Counter = 0;
+int Xmit_Counter = 0;
+char Overflow;
+int wait = 0;
+
+int testing = 0x4;
+
+int main(void)
+{
+    SYSTEMConfig (80000000L, SYS_CFG_WAIT_STATES | SYS_CFG_PCACHE);
+    INTEnableSystemMultiVectoredInt ();  // enable multi vector mode
+
+    PORTDCLR = 0x7;  // turn all leds off
+    TRISDCLR = 0x7;  // configure leds output
+
+    PORTFSET = 0xC;  // set the tx and rx pins high before chaning them
+    TRISFCLR = 0x8;  // configure for output
+    TRISFSET = 0x4;  // configure for input
+
+    U1MODEbits.BRGH = 1;    // brg * 4
+    U1BRG = 42;             // set BRG
+    U1MODEbits.UEN = 1;
+    U1MODEbits.PDSEL = 0;   // 8 bits no parity
+    U1MODEbits.STSEL = 0;   // 1 stop bit
+    U1STAbits.URXISEL = 0;  // interrupt on character recieve
+    U1STAbits.UTXISEL = 0;  // interrupt on every character sent?
+    U1STAbits.URXEN = 1;    // enable UART receiver
+    U1MODEbits.ON = 1;      // turn UART on
+    U1STAbits.UTXEN = 1;    // enable UART transmitter
+    IFS0bits.U1RXIF = 0;    // clear receive flag
+    IFS0bits.U1TXIF = 0;    // clear transmit flag
+    IEC0bits.U1RXIE = 1;    // enable receive interrupts
+    IEC0bits.U1TXIE = 1;    // enable transmit interrupts
+    IEC0bits.T1IE = 1;      // timer 1 interrupts enabled
+    IEC0bits.T2IE = 1;      // timer 2 interrupts enabled
+    mT1SetIntPriority (1);  // set timer priority
+    mT2SetIntPriority (1);  // set timer priority
+
+    T1CONbits.TCKPS = 0x2;  // set timer 1 pre-scaler to 64  (timer 1 is for the debounce)
+    PR1 = 4687;            // set timer 1 pr value
+    TMR1 = 0;               // reset timer 1
+
+    T2CONbits.TCKPS = 0x7;  // 256 pre-scaler
+    PR2 = 39062;            // .5 sec delay
+    TMR2 = 0;               // reset timer 2
+
+    /*************  SETUP DMA    *********/
+
+    IEC1CLR = 0xF0000;      // clear DMA channel interrupts
+    IFS1CLR = 0xF0000;      // clear DMA channel interrupt flags
+
+    DMACONSET = 0x8000;     // enable DMA controller
+    DCH0CON = 0x13;  // configures channel 0 - priority 3 - read
+    DCH1CON = 0x12;  // configures channel 1 - priority 2 - transmit
+    DCH2CON = 0x11;  // configures channel 2 - priority 1 - led
+    DCH3CON = 0x10;  // configures channel 3 - priority 0 - timer
+
+    DCH0ECON = (27 << 8) | 0x10;    // channel 0 starts on U1RX interrupt
+    DCH1ECON = (28 << 8);           // channel 1 starts on U1TX interrupt
+    DCH2ECON = (27 << 8) | 0x10;    // channel 2 starts on U1RX interrupt
+    DCH3ECON = (27 << 8) | 0x10;    // channel 3 starts on U1RX interrupt
+
+    // setup channel 0 addresses
+    DCH0SSA = KVA_TO_PA (&U1RXREG);
+    DCH0DSA = KVA_TO_PA (Buffer);
+    DCH0SSIZ = 1;
+    DCH0DSIZ = 0;
+    DCH0CSIZ = 1;
+
+    // setup channel 1
+    DCH1SSA = KVA_TO_PA (Buffer);
+    DCH1DSA = KVA_TO_PA (&U1TXREG);
+    DCH1SSIZ = 0;
+    DCH1DSIZ = 1;
+    DCH1CSIZ = 1;
+
+    // setup channel 2
+    DCH2SSA = KVA_TO_PA (&LED_On);
+    DCH2DSA = KVA_TO_PA (&PORTDSET);
+    DCH2SSIZ = 1;
+    DCH2DSIZ = 1;
+    DCH2CSIZ = 1;
+
+    // setup channel 3
+    DCH3SSA = KVA_TO_PA (&Start_Timer);
+    DCH3DSA = KVA_TO_PA (&T2CONSET);
+    DCH3SSIZ = 2;
+    DCH3DSIZ = 2;
+    DCH3CSIZ = 2;
+
+    DCH0INTCLR = 0x00ff00ff;    // clear channel 0 events, disable interrutps
+    DCH1INTCLR = 0x00ff00ff;    // clear channel 1 events, disable interrutps
+    DCH2INTCLR = 0x00ff00ff;    // clear channel 2 events, disable interrutps
+    DCH3INTCLR = 0x00ff00ff;    // clear channel 3 events, disable interrutps
+
+    DCH0INTSET = 0x80000;    // set channel 0 block complete interrupts enabled
+    DCH1INTSET = 0x80000;    // set channel 1 block complete interrupts enabled
+    DCH2INTSET = 0x80000;    // set channel 2 block complete interrupts enabled
+    DCH3INTSET = 0x80000;    // set channel 3 block complete interrupts enabled
+
+    IPC9 = 0x1014;              // set DMA channel interrupt priority
+    IEC1SET = 0xf0000;          // enable all dma channels
+
+    DCH0CONSET = 0x80;      // turn channel 0 on
+    DCH1CONSET = 0x80;      // turn channel 1 on
+    DCH2CONSET = 0x80;      // turn channel 2 on
+    DCH3CONSET = 0x80;      // turn channel 3 on
+
+    int button_press = 0;
+    int x = 0;
+
+
+    /*************Latency Test Block****************
+    // check with logic analyzer
+
+    DCH3ECON = (3 << 8) | 0x10;
+
+    DCH3SSA = KVA_TO_PA (&testing);
+    DCH3DSA = KVA_TO_PA (&PORTBINV);
+    DCH3SSIZ = 1;
+    DCH3DSIZ = 1;
+    DCH3CSIZ = 1;
+
+    TRISFCLR = 0x40;    // configure for output
+    TRISBCLR = 0x4;     // configure for output
+    while (1)
+    {
+        for (x = 0; x < 100; x++);
+        PORTFINV = 0x40;
+    }
+     ***********************************************/
+
+    while (1)
+    {
+        // switch debounce + transmit button stuff
+        if (!(PORTC & 0x2) && button_press == 0)
+        {
+            button_press = 1;
+            for (x=0; x < 2; x++)   // check switch 2 times
+            {
+                wait = 1;
+                TMR1 = 0;           // reset timer 1
+                T1CONbits.ON = 1;   // start timer 1
+                while (wait);       // wait for timer to be done
+                button_press = button_press && !(PORTC & 0x2);  // and value of port to button_press
+            }
+            if (button_press)
+            {
+
+                if (Counter == 0 && DCH0DPTR)
+                {
+                    if (DCH0DPTR != 1)
+                        DCH1ECONSET = 0x10;     // Enable sirq enable
+                    DCH1SSIZ = DCH0DPTR;        // change ssiz if we stored less than 256 chars
+                    DCH1ECONSET = 0x80;         // assert cforce
+                }
+                else if (Counter)
+                {
+                    DCH1ECONSET = 0x10;         // Set sirq enable
+                    DCH1ECONSET = 0x80;         // assert Cforce
+                }
+            }
+        }
+        
+        /*  switch release debounce  */
+        else if ((PORTC & 0x2) && button_press == 1)
+        {
+           for (x=0; x < 2; x++)    // check for release 2 times
+            {
+               wait = 1;
+                TMR1 = 0;           // reset timer 1
+                T1CONbits.ON = 1;   // start timer 1
+                while (wait);       // wait for timer
+                button_press = button_press && (PORTC & 0x2);
+            }
+            if (button_press)       // if the switch was succesfully released:
+                button_press = 0;   // clear button_press
+            else
+                button_press = 1;   // button not succesfully released
+        }
+    }
+}
+
+void Block_Read_Complete (void)
+{
+    if (++Counter < 32)
+        DCH0DSA = KVA_TO_PA (Buffer + (Counter * 256));  // shift address up
+    else
+    {
+        Counter = 32;
+        PORTDSET = 0x4;     // turn buffer full LED on
+        DCH0DSA = KVA_TO_PA (&Overflow);    // if too many characters, write garbage
+        DCH0DSIZ = 1;
+    }
+       
+    DCH0INTCLR = 0xff;      // clear DMA interrupt flags
+    IFS1CLR = 0x10000;      // clear core interrupt flags
+}
+
+void Block_Xmit_Complete (void)
+{
+    
+    Xmit_Counter++;
+
+    if (Xmit_Counter < Counter)
+    {
+        DCH1SSA = KVA_TO_PA (Buffer + (Xmit_Counter * 256));     //adjust address
+        DCH1SSIZ = 0;                                           //adjust size
+    }
+    else if (Xmit_Counter == Counter && DCH0DPTR != 0)
+    {
+        DCH1SSIZ = DCH0DPTR;    // change ssiz if we stored less than 256 chars
+        DCH1SSA = KVA_TO_PA (Buffer + (Xmit_Counter * 256));
+    }
+    else
+    {
+        DCH1ECONCLR = 0x10;     // clear sirq enable - stop next transfer
+        // reset conditions
+        DCH0DSA = KVA_TO_PA (Buffer);       // adjust to beggining of address
+        DCH0DSIZ = 0;                       // adjust destination size
+        DCH1SSA = KVA_TO_PA (Buffer);       // adjust to beggining of address
+        DCH1SSIZ = 0;                       // adjust source size
+
+        Counter = 0;        // reset counter
+        Xmit_Counter = 0;   // reset counter
+
+        PORTDCLR = 0x4;  // turn buffer full LED off
+    }
+
+    DCH1INTCLR = 0xff;
+    IFS1CLR = 0x20000;  // clear core interrupt flags
+    
+}
+
+void timer1 (void)
+{
+    TMR1 = 0;           // clear timer 1
+    IFS0bits.T1IF = 0;  // clear timer 1 flag
+    T1CONbits.ON = 0;   // turn timer off
+    wait = 0;           // we have now waited our 15ms, so clear flag
+}
+
+void timer2 (void)
+{
+    PORTDCLR = 0x1;     // turn receive in-progress led off
+    TMR2 = 0;           // clear timer 2
+    IFS0bits.T2IF = 0;  // clear interrupt flag
+    T2CONbits.ON = 0;   // turn timer 2 off
+}
