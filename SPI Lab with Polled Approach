@@ -1,0 +1,222 @@
+/*
+ * File:   Lab 5 main.c
+ * Author: kevin.juba
+ *
+ * Created on October 30, 2014, 10:42 AM
+ */
+#define _SUPPRESS_PLIB_WARNING
+#include <xc.h>
+#include <plib.h>
+
+#pragma config POSCMOD=XT, FNOSC=PRIPLL, FPLLIDIV=DIV_2, FPLLMUL=MUL_20, FPLLODIV=DIV_1
+#pragma config FPBDIV=DIV_1, FWDTEN=OFF, CP=OFF, BWP=OFF
+#pragma config FSOSCEN=OFF, IESO=OFF
+
+#pragma interrupt SPI IPL4 vector 23
+void SPI (void);
+void ReadEEProm (int nbytes, unsigned int address, unsigned char readbuffer[]);
+void WriteEEProm (int nbytes, unsigned int address, unsigned char writebuffer []);
+
+int EEPromSysBusy = 0;
+int state = 0;
+int ReadWrite = 0;  // read = 0, write = 1
+unsigned int MSA = 0;  // upper bits of the address
+unsigned int LSA = 0;  // lower 16 bits of the address
+unsigned char * temp;  // character pointer - points to arrays
+int num_bytes = 0;	// how many bytes left to read / write
+
+int main(void)
+{
+    int x = 0;
+    unsigned char writebuffer [64];
+    unsigned char readbuffer [64];
+
+    SYSTEMConfig (80000000L, SYS_CFG_WAIT_STATES | SYS_CFG_PCACHE);
+    INTEnableSystemMultiVectoredInt ();  // enable multi vector mode
+
+    AD1PCFGSET = 0x404;  // set rb10 for digital output
+    PORTBSET = 0x404;  // set port latch high
+    TRISBCLR = 0x404;  // configure for output
+
+    SPI1CONCLR = 0x8000;  // turn SPI1 off
+    SPI1BUF;  // clear SPI1BUF
+    SPI1BRG = 0x8;  // set SPI1 BRG
+    SPI1STATCLR = 0x40;  // clear overflow bit
+
+    SPI1CONbits.CKE = 0;  // set Clock edge bit
+    SPI1CONbits.CKP = 1;  // set Clock polarity bit
+    SPI1CONbits.SMP = 0;  // set SPI data input sample phase bit
+    SPI1CONbits.MSTEN = 1;  // set to master mode
+
+    mSPI1SetIntPriority (4);  // set priority level
+    IFS0bits.SPI1RXIF = 0;
+    IEC0bits.SPI1RXIE = 1;  // enable interrupts for SPI RX
+    //IEC0bits.SPI1TXIE = 1;  // enable interrupts for SPI TX
+
+    SPI1CONSET = 0x8000;  // turn SPI1 on
+
+    for (x = 0; x < 64; x++)
+    {
+        writebuffer [x] = x+32;  // initialize read and write buffers
+        readbuffer [x] = 0;
+    }
+
+    WriteEEProm (20, 0xB00, writebuffer);  // write data
+
+    ReadEEProm (20, 0xB00, readbuffer);  // read data
+
+    while (1);
+}
+
+void SPI (void)
+{
+    int status = 0;
+    IFS0CLR = 0x2000000;
+
+    switch (state)
+    {
+        case 0:
+            PORTBCLR = 0x400;  // assert CS
+            SPI1BUF = 0x05;  // send 'read status' command
+            while (TxBufFullSPI1 ());  // wait for TBE
+            SPI1BUF = 0x0; // send oDummy
+            state = 1;
+            break;
+
+        case 1:
+            SPI1BUF;  // read iDummy
+            state = 2;
+            break;
+
+        case 2:
+            PORTBSET = 0x400;  // negate CS
+            status = SPI1BUF;  // read status
+            PORTBCLR = 0x400;  // assert CS
+            if ((status & 1) == 1)  // make sure status.wip is clear
+            {
+                SPI1BUF = 0x5;  // send 'read status' command
+                while (TxBufFullSPI1 ());  // wait for TBE
+                SPI1BUF = 0x0; // send oDummy
+                state = 1;
+            }
+            else if (ReadWrite)  // if ReadWrite == 1, write operation
+            {
+                SPI1BUF = 0x6;  // send 'write enable' command
+                state = 3;  // write
+            }
+            else
+            {
+                SPI1BUF = 0x3;  // send 'read' command
+                while (TxBufFullSPI1 ());  // wait for TBE
+                SPI1BUF = MSA;  // send msa
+                state = 8;  // read
+            }
+            break;
+
+////////////////////////////////////////////////////////// start of write
+
+        case 3:
+            PORTBSET = 0x400;  // negate CS
+            SPI1BUF;  // read dummy data
+            PORTBCLR = 0x400;  // assert CS
+            SPI1BUF = 0x2;  // send 'write' command
+            while (TxBufFullSPI1 ());  // wait for TBE
+            SPI1BUF = MSA;  // send msa
+            state = 4;
+            break;
+
+
+        case 4:
+            SPI1BUF;  // read dummy data
+            SPI1BUF = LSA;  // write lsa
+            state = 5;
+            break;
+
+        case 5:
+            SPI1BUF;  // read dummy data
+            SPI1BUF = *(temp++);  // write data;
+            if (--num_bytes <= 0)   // any more bytes to write?
+                state = 6;
+            break;
+
+        case 6:
+            SPI1BUF;  // read dummy data
+            state = 7;
+            break;
+
+        case 7:
+            SPI1BUF;  // read dummy data
+            PORTBSET = 0x400;  // negate CS
+            state = 0;
+            EEPromSysBusy = 0;
+            break;
+
+///////////////////////////////////////////////////////// start of read
+        case 8:
+            SPI1BUF;  // read dummy data
+            SPI1BUF = LSA;  // write LSA
+            state = 9;
+            break;
+
+        case 9:
+            SPI1BUF;  // read dummy data b
+            SPI1BUF = 0x0;  // write dummy data;
+            state = 10;
+            break;
+
+        case 10:
+            SPI1BUF;  // read dummy data c
+            if (num_bytes > 1)
+                SPI1BUF = 0x0;  // write extra dummy if more than 1 byte to read
+            state = 11;
+            break;
+
+        case 11:
+            if (--num_bytes <= 0)	// read last byte
+            {
+                *(temp++) = SPI1BUF;  // read data
+                PORTBSET = 0x400;  // negate CS
+                state = 0;          // reset state
+                EEPromSysBusy = 0;  // system not busy
+                PORTBINV = 0x4;
+            }
+            else if (num_bytes == 1)  // 2 bytes left to read
+                *(temp++) = SPI1BUF;  // read data
+            else					// more than 2 bytes to read
+            {
+                *(temp++) = SPI1BUF;  // read data
+                SPI1BUF = 0x0;  // dummy write
+            }
+            break;
+    }
+}
+
+void WriteEEProm (int nbytes, unsigned int address, unsigned char writebuffer [])
+{
+    while (EEPromSysBusy);
+    EEPromSysBusy = 1;
+    temp = writebuffer;  // set global pointer equal to start of write buffer
+    num_bytes = nbytes;  // set global byte variable
+    MSA = address >> 8;  // set MSA
+    LSA = address & 0x00FF;  // Set LSA
+    ReadWrite = 1;  // set for write operation
+
+    IFS0bits.SPI1RXIF = 1;  // set interrupt flag
+
+    while (EEPromSysBusy);
+}
+
+void ReadEEProm (int nbytes, unsigned int address, unsigned char readbuffer[])
+{
+    while (EEPromSysBusy);  // wait for system not busy
+    EEPromSysBusy = 1;      // set system busy
+    num_bytes = nbytes;     // set global byte variable
+    MSA = address >> 8;     // Set MSA
+    LSA = address & 0x00FF; // Set LSA
+    ReadWrite = 0;          // Set for read opertation
+    temp = readbuffer;
+
+    IFS0bits.SPI1RXIF = 1;  // trigger interrupt
+    //PORTBINV = 0x4;
+    while (EEPromSysBusy);
+}
